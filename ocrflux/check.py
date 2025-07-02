@@ -24,7 +24,11 @@ def check_vllm_version():
         sys.exit(1)
 
 
-def check_torch_gpu_available(min_gpu_memory: int = 12 * 1024**3):
+def check_torch_gpu_available(min_gpu_memory: int = 12 * 1024**3, skip_check: bool = False):
+    if skip_check:
+        logger.info("Skipping GPU check as external vLLM server is being used")
+        return
+        
     try:
         import torch
     except:
