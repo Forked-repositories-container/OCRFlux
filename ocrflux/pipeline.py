@@ -9,6 +9,8 @@ import os
 import copy
 import random
 import re
+import signal
+import sys
 import sys
 import time
 from concurrent.futures.process import BrokenProcessPool
@@ -59,6 +61,9 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 # Global variables for token statistics
 metrics = MetricsKeeper(window=60 * 5)
 tracker = WorkerTracker()
+
+# Global shutdown flag for remote VLLM request cancellation
+shutdown_requested = False
 
 def build_page_to_markdown_query(args, pdf_path: str, page_number: int, target_longest_image_dim: int, image_rotation: int = 0) -> dict:
     assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
@@ -131,6 +136,10 @@ def build_html_table_merge_query(args,text_1,text_2) -> dict:
 # Ex. the sessionpool in httpcore has 4 different locks in it, and I've noticed
 # that at the scale of 100M+ requests, that they deadlock in different strange ways
 async def apost(url, json_data):
+    # Check if shutdown was requested (only affects remote connections)
+    if shutdown_requested:
+        raise asyncio.CancelledError("Remote VLLM request cancelled due to shutdown")
+        
     parsed_url = urlparse(url)
     host = parsed_url.hostname
     port = parsed_url.port or 80
@@ -151,6 +160,10 @@ async def apost(url, json_data):
         )
         writer.write(request.encode())
         await writer.drain()
+
+        # Check shutdown during request processing
+        if shutdown_requested:
+            raise asyncio.CancelledError("Remote VLLM request cancelled during processing")
 
         # Read status line
         status_line = await reader.readline()
@@ -178,11 +191,14 @@ async def apost(url, json_data):
             raise ConnectionError("Anything other than fixed content length responses are not implemented yet")
 
         return status_code, response_body
+    except asyncio.CancelledError:
+        logger.info("Remote VLLM HTTP request cancelled - connection closed to cancel server-side processing")
+        raise
     except Exception as e:
         # Pass through errors
         raise e
     finally:
-        # But just make sure to close the socket on your way out
+        # Close socket to immediately cancel server-side processing
         if writer is not None:
             try:
                 writer.close()
@@ -724,6 +740,16 @@ async def metrics_reporter(work_queue):
         logger.info("\n" + str(await tracker.get_status_table()))
         await asyncio.sleep(10)
 
+def setup_remote_vllm_cancellation():
+    """Setup signal handler to cancel remote VLLM requests on process termination"""
+    def signal_handler(signum, frame):
+        global shutdown_requested
+        logger.info(f"Received signal {signum} - cancelling remote VLLM requests by closing connections")
+        shutdown_requested = True
+    
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill command
+
 async def main():
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
     parser.add_argument(
@@ -760,6 +786,11 @@ async def main():
     parser.add_argument("--port", type=int, default=40078, help="Port to use for the VLLM server")
     parser.add_argument("--remote_host", type=str, default=None, help="External vLLM server URL (e.g., http://server:8000). If provided, will not start local vLLM server")
     args = parser.parse_args()
+
+    # Setup remote VLLM request cancellation only when using remote host
+    if args.remote_host:
+        setup_remote_vllm_cancellation()
+        logger.info(f"Remote VLLM cancellation enabled for {args.remote_host}")
 
     if os.path.exists(args.workspace):
         shutil.rmtree(args.workspace)
@@ -878,7 +909,20 @@ async def main():
         worker_tasks.append(task)
 
     # Wait for all worker tasks to finish
-    await asyncio.gather(*worker_tasks)
+    try:
+        await asyncio.gather(*worker_tasks)
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt - cancelling all tasks")
+        # Cancel all tasks
+        for task in worker_tasks:
+            task.cancel()
+        if not args.remote_host:
+            vllm_server.cancel()
+        metrics_task.cancel()
+        
+        # Wait a brief moment for tasks to clean up
+        await asyncio.gather(*worker_tasks, vllm_server if not args.remote_host else asyncio.sleep(0), metrics_task, return_exceptions=True)
+        raise  # Re-raise to exit the program
 
     # Cancel tasks only if they exist
     if not args.remote_host:
