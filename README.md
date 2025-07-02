@@ -268,9 +268,16 @@ For quick testing, try the [web demo](https://5f65ccdc2d4fd2f364.gradio.live). T
     ```
 
 - For a directory of pdf or images:
-    ```bash
-    python -m ocrflux.pipeline ./localworkspace --data test_pdf_dir/* --model /model_dir/OCRFlux-3B
-    ```
+
+  ```bash
+  python -m ocrflux.pipeline ./localworkspace --data test_pdf_dir/* --model /model_dir/OCRFlux-3B
+  ```
+
+- Using external vLLM server:
+  ```bash
+  python -m ocrflux.pipeline ./localworkspace --data test.pdf --remote_host http://your-server:8000
+  ```
+
 You can set `--skip_cross_page_merge` to skip the cross-page merging in the parsing process to accelerate, it would simply concatenate the parsing results of each page to generate final Markdown of the document.
 
 Results will be stored as JSONL files in the `./localworkspace/results` directory. 
@@ -345,6 +352,8 @@ options:
   --skip_cross_page_merge
                         Whether to skip cross-page merging
   --port PORT           Port to use for the VLLM server
+  --remote_host remote_host
+                        External vLLM server URL (e.g., http://server:8000). If provided, will not start local vLLM server
 ```
 
 ## Code overview

@@ -191,7 +191,10 @@ async def apost(url, json_data):
                 pass
 
 async def process_task(args, worker_id, task_name, task_args):
-    COMPLETION_URL = f"http://localhost:{args.port}/v1/chat/completions"
+    if args.remote_host:
+        COMPLETION_URL = f"{args.remote_host}/v1/chat/completions"
+    else:
+        COMPLETION_URL = f"http://localhost:{args.port}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     exponential_backoffs = 0
@@ -675,7 +678,10 @@ async def vllm_server_host(args, semaphore):
 async def vllm_server_ready(args):
     max_attempts = 300
     delay_sec = 1
-    url = f"http://localhost:{args.port}/v1/models"
+    if args.remote_host:
+        url = f"{args.remote_host}/v1/models"
+    else:
+        url = f"http://localhost:{args.port}/v1/models"
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -683,16 +689,25 @@ async def vllm_server_ready(args):
                 response = await session.get(url)
 
                 if response.status_code == 200:
-                    logger.info("vllm server is ready.")
+                    if args.remote_host:
+                        logger.info("External vllm server is ready.")
+                    else:
+                        logger.info("vllm server is ready.")
                     return
                 else:
                     logger.info(f"Attempt {attempt}: Unexpected status code {response.status_code}")
         except Exception:
-            logger.warning(f"Attempt {attempt}: Please wait for vllm server to become ready...")
+            if args.remote_host:
+                logger.warning(f"Attempt {attempt}: Please wait for external vllm server to become ready...")
+            else:
+                logger.warning(f"Attempt {attempt}: Please wait for vllm server to become ready...")
 
         await asyncio.sleep(delay_sec)
 
-    raise Exception("vllm server did not become ready after waiting.")
+    if args.remote_host:
+        raise Exception("External vllm server did not become ready after waiting.")
+    else:
+        raise Exception("vllm server did not become ready after waiting.")
 
 async def download_model(model_name_or_path: str):
     if os.path.isabs(model_name_or_path) and os.path.isdir(model_name_or_path):
@@ -743,6 +758,7 @@ async def main():
     parser.add_argument("--skip_cross_page_merge", action="store_true", help="Whether to skip cross-page merging")
 
     parser.add_argument("--port", type=int, default=40078, help="Port to use for the VLLM server")
+    parser.add_argument("--remote_host", type=str, default=None, help="External vLLM server URL (e.g., http://server:8000). If provided, will not start local vLLM server")
     args = parser.parse_args()
 
     if os.path.exists(args.workspace):
@@ -816,14 +832,20 @@ async def main():
         await work_queue.populate_queue(json_work_paths, args.pages_per_group)
 
 
-    # If you get this far, then you are doing inference and need a GPU
-    check_vllm_version()
-    check_torch_gpu_available()
+    # If you get this far and using local vLLM, then you are doing inference and need a GPU
+    if not args.remote_host:
+        check_vllm_version()
+        check_torch_gpu_available()
+    else:
+        logger.info(f"Using external vLLM server at: {args.remote_host}")
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
-    # Download the model before you do anything else
-    await download_model(args.model)
+    # Download the model before you do anything else (only if using local vLLM)
+    if not args.remote_host:
+        await download_model(args.model)
+    else:
+        logger.info("Skipping model download as external vLLM server is being used")
 
     # Initialize the work queue
     qsize = await work_queue.initialize_queue()
@@ -835,9 +857,15 @@ async def main():
     # We only allow one worker to move forward with requests, until the server has no more requests in its queue
     # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
-    semaphore = asyncio.Semaphore(1)
+    # For external servers, we use a more relaxed semaphore since we can't monitor the queue
+    if args.remote_host:
+        semaphore = asyncio.Semaphore(args.workers)  # Allow all workers for external server
+    else:
+        semaphore = asyncio.Semaphore(1)  # Use strict control for local server
 
-    vllm_server = asyncio.create_task(vllm_server_host(args, semaphore))
+    # Start vLLM server only if not using external server
+    if not args.remote_host:
+        vllm_server = asyncio.create_task(vllm_server_host(args, semaphore))
 
     await vllm_server_ready(args)
 
@@ -852,7 +880,9 @@ async def main():
     # Wait for all worker tasks to finish
     await asyncio.gather(*worker_tasks)
 
-    vllm_server.cancel()
+    # Cancel tasks only if they exist
+    if not args.remote_host:
+        vllm_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
 
